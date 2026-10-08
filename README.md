@@ -21,6 +21,7 @@ flowchart LR
     H[Home server<br/>frpc] -->|outbound tunnel| R
     L[My PC on LAN] -->|local forward| H
     A[Admin devices] -->|Tailscale| H
+    A -->|Tailscale| R
     H --> C[Game server<br/>Docker container]
 ```
 
@@ -30,8 +31,8 @@ flowchart LR
 - **The relay is stateless.** It only forwards traffic. If it dies, I can redeploy
   it in minutes with no data loss.
 - **LAN players skip the relay** through a local port forward (~1 ms vs ~90 ms).
-- **Admin access goes over Tailscale** only. Management tools are never exposed
-  through the public tunnel.
+- **Admin access goes over Tailscale** only, for both the home server and the
+  relay. Management tools and SSH are never exposed to the internet.
 - **ISP-independent.** Since everything dials out, I can switch ISPs or routers
   without touching the relay, DNS, or DDNS.
 
@@ -50,7 +51,7 @@ built a self-hosted version to understand how it works.
 | Tunneling | frp (reverse proxy), Tailscale (admin VPN) |
 | Game hosting | Pterodactyl panel + Wings, Docker, NeoForge 1.21.1 (130+ mods) |
 | Panel backend | nginx, PHP-FPM, MariaDB, Redis |
-| Other services | Immich (photos), Syncthing, Portainer |
+| Other services | Immich (photos), Portainer |
 | Security | UFW, fail2ban, key-only SSH |
 | Monitoring | Custom Bash scripts, Python web dashboard, Telegram bot |
 
@@ -63,6 +64,9 @@ built a self-hosted version to understand how it works.
 - Two firewall layers: the Azure network security group plus UFW on each host.
   Only the ports the service needs are open.
 - SSH is key-only, root login is disabled, and fail2ban runs on both hosts.
+- No public SSH. Admin SSH to the relay goes over Tailscale only, and port 22 is
+  denied in the Azure network security group. The only public ports are the
+  tunnel and the game port.
 - The database is bound to localhost only.
 - Management UIs (panel, Docker UI, dashboard) are LAN or Tailscale only.
 - Each game server runs in its own Docker container.
@@ -78,8 +82,11 @@ relay.
   port was closed with a follow-up scan.
 - **Informational findings:** I documented these as accepted risks, each with a
   written reason and a fix ready if the threat model changes.
-- **External surface confirmed minimal:** only the tunnel and SSH ports are
+- **External surface confirmed minimal:** only the tunnel and SSH ports were
   reachable from the internet. Everything else is filtered.
+- **Follow-up (fixed):** public SSH on the relay was logged as an accepted risk.
+  I later moved relay admin to Tailscale, tested it, then denied port 22 in the
+  network security group. A scan from outside now times out on SSH.
 
 **Telegram bot hardening**
 
@@ -101,8 +108,8 @@ The ops bot can restart services, so I designed it to be safe:
   an alert if a backup fails.
 - **Power tracking:** logs CPU power every minute and estimates wall draw and
   monthly electricity cost from local utility rates.
-- **Automation:** cron handles the nightly shutdown, weekly backups, and a CPU
-  frequency cap on boot to keep temps stable.
+- **Automation:** cron handles the nightly shutdown, weekly backups with
+  automatic rotation, and a CPU frequency cap on boot to keep temps stable.
 - **Cost awareness:** I track cloud egress against the free tier. It averages
   about 15 GB/month against a 100 GB limit.
 
@@ -121,11 +128,12 @@ Real problems I diagnosed and fixed:
 | Players crashed on join after a mod update | Client and server configs didn't match | Set a rule: every change goes to the server and all clients at once |
 | Couldn't SSH into the relay from Windows | The key file was readable by other user groups, so OpenSSH refused it | Removed the extra permissions until only my user could read the key |
 | Drive failed to boot | External drive's USB-C cable failed | Swapped cables and documented a spare-cable policy |
+| Backups grew to 35 GB on the server drive | Nothing ever deleted old backups | Checked the newest backup was valid (`gzip -t`), pruned to the newest 3, then added rotation to cron. Rotation only runs if the new backup succeeds, so a failed backup never deletes the old ones |
 
 Some honest gaps I've found in my own setup and plan to fix:
 
 - Weekly backups get skipped if the machine is off at the scheduled time.
-  Plan: catch-up backup on boot, plus automatic rotation.
+  Plan: catch-up backup on boot.
 - Backups are on the same drive as the server. Plan: add offline and offsite copies.
 
 ---
@@ -148,7 +156,8 @@ This README is the public summary.
 
 ## Roadmap
 
-- Automated backup rotation, plus an offsite copy to cloud storage
-- Move admin SSH on the relay to Tailscale only, and close the public SSH port
+- Offsite copy of the game world backups
+- Custom domain for the relay, so the address survives a provider switch
+- Move the relay to a cheaper VPS closer to PH players when cloud credit runs out
 - Wazuh (HIDS) for security monitoring
 - Dedicated mini PC running Proxmox to replace the laptop
