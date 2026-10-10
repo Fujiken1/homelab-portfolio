@@ -1,15 +1,30 @@
-# Fujiken — Self-Hosted Home Lab Behind CGNAT
+# Fujiken Homelab
 
-A home lab built on a repurposed gaming laptop. It hosts a modded Minecraft server
-for a private group of friends, plus a self-hosted photo library and Docker
-management tools.
+A self-hosted homelab that I built and run on an old gaming laptop. It hosts game servers
+for my friends, a private photo library, and an internal dashboard. It sits behind CGNAT,
+so nothing on my home network is open to the internet.
 
-The main challenge: my home internet is behind **CGNAT**, so I can't port-forward.
-I solved it with a **reverse tunnel through a cloud relay VM**. The home network
-never accepts any inbound connections.
+I'm a cybersecurity graduate focused on **cloud security**. I use this lab to practice the
+same patterns companies use: zero trust access, least privilege, a single reverse proxy
+with automated TLS, policy as code, and real documentation.
 
-> This is a sanitized, public version of my internal runbook. Hostnames, IPs,
-> credentials, and internal paths have been removed.
+> Running since June 2026. This is a sanitized public summary. It leaves out IP addresses,
+> hostnames, usernames, and other details that would help an attacker. The full runbook
+> lives in a private repo.
+
+---
+
+## At a glance
+
+| Part | What I use |
+| --- | --- |
+| Server | Gaming laptop (Ryzen 5 6600H, 24 GB RAM) running Ubuntu Server 24.04 from an external NVMe |
+| Public entry | A small Azure VM that works as a reverse-tunnel relay |
+| Private access | Tailscale (WireGuard) mesh network with identity-based rules |
+| Front door for private apps | Caddy reverse proxy with automatic wildcard TLS |
+| DNS + email | My own domain on Cloudflare: DNS, email routing, anti-spoofing |
+| Workloads | Minecraft + Terraria servers (Pterodactyl + Docker), Immich photo library, Homepage dashboard, custom monitoring |
+| Users | Me, a small group of friends (game servers only), and one guest with limited panel access |
 
 ---
 
@@ -17,147 +32,195 @@ never accepts any inbound connections.
 
 ```mermaid
 flowchart LR
-    F[Friends] -->|game traffic| R[Azure relay VM<br/>frps]
-    H[Home server<br/>frpc] -->|outbound tunnel| R
-    L[My PC on LAN] -->|local forward| H
-    A[Admin devices] -->|Tailscale| H
-    A -->|Tailscale| R
-    H --> C[Game server<br/>Docker container]
+    subgraph Internet
+        P[Friends' game clients]
+    end
+
+    subgraph Cloud["Azure VM - relay"]
+        FRPS[frps]
+    end
+
+    subgraph Home["Home network - behind CGNAT"]
+        subgraph Server["Homelab server"]
+            FRPC[frpc]
+            GAMES[Game servers in Docker]
+            CADDY[Caddy - HTTPS 443]
+            APPS[Panel / Photos / Dashboard / Monitor]
+        end
+    end
+
+    subgraph Tailnet["Tailscale tailnet"]
+        ME[My devices]
+        GUEST[Guest device]
+    end
+
+    P -->|game ports only| FRPS
+    FRPC -->|outbound tunnel| FRPS
+    FRPC --> GAMES
+    ME -->|WireGuard| CADDY
+    GUEST -->|one port, panel only| CADDY
+    CADDY --> APPS
 ```
 
-- **The home server only makes outbound connections.** `frpc` dials out to the
-  relay, and the relay forwards game traffic back through that tunnel. This is
-  what gets around CGNAT.
-- **The relay is stateless.** It only forwards traffic. If it dies, I can redeploy
-  it in minutes with no data loss.
-- **LAN players skip the relay** through a local port forward (~1 ms vs ~90 ms).
-- **Admin access goes over Tailscale** only, for both the home server and the
-  relay. Management tools and SSH are never exposed to the internet.
-- **ISP-independent.** Since everything dials out, I can switch ISPs or routers
-  without touching the relay, DNS, or DDNS.
+**The key idea:** the server only makes **outbound** connections. Game traffic comes in
+through the cloud relay and down an outbound tunnel. Admin access and private apps never
+touch the public internet. They are only reachable over Tailscale.
 
-This is the same pattern that Cloudflare Tunnel and ngrok sell as a product. I
-built a self-hosted version to understand how it works.
+Cloudflare Tunnel, ngrok, and Tailscale Funnel sell this same relay pattern as products.
+This is my self-hosted version of it.
 
 ---
 
-## Stack
+## Security design
 
-| Layer | Tools |
+### 1. Nothing inbound at home
+The home network has no port forwarding and no public services. CGNAT hides it, and the
+server only dials out. Changing ISPs or routers doesn't affect remote access.
+
+### 2. Small public surface
+Only the relay is public, and it only exposes the game ports and the tunnel's control port.
+Admin SSH on the relay is **closed to the internet** and only works over Tailscale.
+Firewalls run at two layers: the cloud network security group and the host firewall (UFW).
+
+### 3. Zero trust for everything private
+To reach a private app, a request has to pass **four separate checks**:
+1. The device must be logged into my tailnet (identity)
+2. A tailnet policy must allow that user to that host and port
+3. The reverse proxy must allow that device to that app's hostname
+4. The app's own login
+
+Private hostnames do resolve in public DNS, but only to private tailnet addresses.
+**Knowing a name gives you nothing.** Security comes from identity and policy, not from
+keeping names secret.
+
+### 4. One front door
+All private apps sit behind a single Caddy reverse proxy:
+- HTTPS for everything, with certificates that renew by themselves
+- A **wildcard certificate** obtained through a DNS challenge. Public Certificate
+  Transparency logs only show the wildcard, so my individual app names don't leak.
+  Nothing has to be public to get the certificate.
+- The host firewall only lets tailnet devices reach the proxy
+- Any unknown hostname gets its connection dropped
+
+### 5. Least privilege for a guest user
+A friend helps run one of the game servers. His access is limited at every layer:
+- **Network:** a tailnet grant to one host and one port
+- **Policy tests:** the access policy includes automated tests. They check that he
+  **can** reach the one allowed port and **can't** reach SSH or any other service. If a
+  change would widen his access, the policy refuses to save. It's policy as code with tests.
+- **Proxy:** IP-based rules only let his device reach the game panel hostnames
+- **App:** the panel role only shows his own server
+
+### 6. Email security
+- **DMARC set to reject.** The domain never sends mail, so any mail claiming to be from it is fake.
+- **Receive-only aliases.** Every service gets its own address. If one starts getting spam,
+  I know who leaked it, and I can block just that alias. The real inbox stays hidden.
+
+### 7. Hardening basics
+- SSH: keys only, root login disabled, fail2ban on both machines
+- Database bound to localhost only
+- The DNS API token only has DNS rights for one domain, and it lives in a locked env file, not in the config
+- 2FA on the accounts that control DNS and network access
+- **Removed services I didn't use**, including a Docker admin UI with root-level access.
+  Less software = less attack surface.
+
+### 8. Self-assessment
+I ran a read-only recon engagement against my own setup from Kali Linux (nmap, nikto,
+curl). It found a database listening on all network interfaces. I fixed it in the same
+session and verified the fix with a second scan. Later, I moved relay admin access to
+Tailscale only and confirmed public SSH was closed. A follow-up scan after the October
+2026 changes is next, so I can compare before and after.
+
+---
+
+## Problems I solved
+
+**Container IP roulette.** The tunnel pointed at a Docker container's internal IP. Once I
+ran more than one server, those IPs could swap after a restart, which would send players
+to the wrong world. I pinned each server to its own fixed loopback address and pointed the
+tunnel there instead.
+
+**Many servers, one tunnel.** One tunnel connection can carry many forwarded ports. Each
+server got its own port and subdomain. For the server on a non-default port, I added a
+DNS **SRV record**, so players just type the name and the game finds the port by itself.
+
+**Mixed content.** After I moved the game panel to HTTPS, the in-browser server console
+stopped working. The browser talks directly to the game daemon, and it was blocking that
+plain-HTTP connection from an HTTPS page. I put the daemon behind the same reverse proxy
+on its own hostname. It still runs plain HTTP internally, and the proxy handles TLS.
+
+**Port collisions.** The reverse proxy and an existing web server both wanted port 80.
+Later, the game daemon tried to take 443 from the proxy. Both times the fix was to
+separate the port the **browser** uses from the port the service **listens** on inside
+the box.
+
+**Firewall vs. containers.** A dashboard widget couldn't read my monitoring API. The host
+firewall was blocking traffic from Docker's internal network. I allowed only Docker's
+private range to that one port, nothing else.
+
+**Policy tests doing their job.** When I tightened the guest's access, the save failed,
+because an old test still expected the old ports. I had to update the rule and the test
+together. That's exactly what the tests are for: no silent changes to access.
+
+---
+
+## Operations
+
+- **Monitoring:** a web dashboard with history graphs and a JSON API, a live terminal
+  dashboard, and health-check scripts for both machines
+- **Alerts:** a Telegram bot sends a status report every 2 hours and electricity cost
+  reports on demand. It also runs a **fixed whitelist** of admin commands (no shell access)
+- **Internal portal:** a Homepage dashboard with live server and photo stats, up/down
+  status for each app, and bookmarks. It's my browser's start page
+- **Backups:** weekly automated world backups with rotation. Old backups are only deleted
+  after a new one succeeds
+- **Planned maintenance:** a scheduled weekly shutdown with an alert first, a CPU frequency
+  cap for thermals, and a UPS for brownouts
+- **Documentation:** a private runbook with the full inventory, port map, troubleshooting
+  log, disaster recovery plan, and cost tracking. It gets updated with every change
+
+---
+
+## Timeline
+
+| When | What |
 | --- | --- |
-| Hardware | Ryzen 5 6600H laptop, 24 GB RAM, external NVMe, UPS |
-| OS | Ubuntu Server 24.04 LTS (LVM) |
-| Cloud relay | Microsoft Azure VM (Ubuntu), network security group firewall |
-| Tunneling | frp (reverse proxy), Tailscale (admin VPN) |
-| Game hosting | Pterodactyl panel + Wings, Docker, NeoForge 1.21.1 (130+ mods) |
-| Panel backend | nginx, PHP-FPM, MariaDB, Redis |
-| Other services | Immich (photos), Portainer |
-| Security | UFW, fail2ban, key-only SSH |
-| Monitoring | Custom Bash scripts, Python web dashboard, Telegram bot |
-
----
-
-## Security
-
-**Design choices**
-- Zero inbound exposure on the home network. The real home IP is hidden behind the relay.
-- Two firewall layers: the Azure network security group plus UFW on each host.
-  Only the ports the service needs are open.
-- SSH is key-only, root login is disabled, and fail2ban runs on both hosts.
-- No public SSH. Admin SSH to the relay goes over Tailscale only, and port 22 is
-  denied in the Azure network security group. The only public ports are the
-  tunnel and the game port.
-- The database is bound to localhost only.
-- Management UIs (panel, Docker UI, dashboard) are LAN or Tailscale only.
-- Each game server runs in its own Docker container.
-
-**Penetration test**
-
-I ran a read-only recon assessment against my own setup from Kali Linux (WSL2),
-using nmap, nikto, and manual banner grabbing against both the LAN and the public
-relay.
-
-- **Finding (medium, fixed):** MariaDB was listening on all interfaces, so any
-  device on the LAN could reach it. I rebound it to localhost and confirmed the
-  port was closed with a follow-up scan.
-- **Informational findings:** I documented these as accepted risks, each with a
-  written reason and a fix ready if the threat model changes.
-- **External surface confirmed minimal:** only the tunnel and SSH ports were
-  reachable from the internet. Everything else is filtered.
-- **Follow-up (fixed):** public SSH on the relay was logged as an accepted risk.
-  I later moved relay admin to Tailscale, tested it, then denied port 22 in the
-  network security group. A scan from outside now times out on SSH.
-
-**Telegram bot hardening**
-
-The ops bot can restart services, so I designed it to be safe:
-- It only runs a fixed whitelist of commands. There's no shell or eval command.
-- It ignores messages from any chat except mine.
-
----
-
-## Monitoring & Operations
-
-- **Health checks:** one script per host. Together they show which side is broken
-  (home server or relay).
-- **Web dashboard:** a custom Python dashboard with live graphs and a JSON metrics
-  endpoint.
-- **Terminal dashboard:** live CPU, RAM, disk temp, network, and container status.
-- **Telegram bot:** sends a status report every 2 hours and reports electricity
-  cost on demand. It can also restart services and trigger backups remotely, with
-  an alert if a backup fails.
-- **Power tracking:** logs CPU power every minute and estimates wall draw and
-  monthly electricity cost from local utility rates.
-- **Automation:** cron handles the nightly shutdown, weekly backups with
-  automatic rotation, and a CPU frequency cap on boot to keep temps stable.
-- **Cost awareness:** I track cloud egress against the free tier. It averages
-  about 15 GB/month against a 100 GB limit.
-
----
-
-## Incidents & Lessons Learned
-
-Real problems I diagnosed and fixed:
-
-| Problem | Root cause | Fix |
-| --- | --- | --- |
-| Server shut down at 10 AM instead of 2 AM | System timezone was UTC, so cron ran 8 hours off | Set the correct timezone, and documented it as a post-install step |
-| Panel console stuck loading after the timezone fix | The game daemon cached auth tokens from before the clock jumped | Restarted the daemon |
-| Boot hung waiting for the network | Ethernet was unplugged, so the network wait never finished | Found the cause. Planned fix: mark the interface optional |
-| Server went offline mid-day | ISP outage, not hardware | Used missed scheduled reports to pin down the downtime window |
-| Players crashed on join after a mod update | Client and server configs didn't match | Set a rule: every change goes to the server and all clients at once |
-| Couldn't SSH into the relay from Windows | The key file was readable by other user groups, so OpenSSH refused it | Removed the extra permissions until only my user could read the key |
-| Drive failed to boot | External drive's USB-C cable failed | Swapped cables and documented a spare-cable policy |
-| Backups grew to 35 GB on the server drive | Nothing ever deleted old backups | Checked the newest backup was valid (`gzip -t`), pruned to the newest 3, then added rotation to cron. Rotation only runs if the new backup succeeds, so a failed backup never deletes the old ones |
-
-Some honest gaps I've found in my own setup and plan to fix:
-
-- Weekly backups get skipped if the machine is off at the scheduled time.
-  Plan: catch-up backup on boot.
-- Backups are on the same drive as the server. Plan: add offline and offsite copies.
-
----
-
-## Documentation
-
-I keep a detailed internal runbook covering:
-- component inventory and port map
-- boot and daily operations
-- a crontab reference
-- a maintenance schedule
-- a troubleshooting table built from real incidents
-- security posture and accepted risks
-- a disaster recovery plan
-- a cost breakdown
-
-This README is the public summary.
+| Jun 2026 | Server and cloud relay live. Pterodactyl game panel. First monitoring scripts and Telegram alerts |
+| Jun 25, 2026 | Self pentest. Database exposure found and fixed the same day |
+| Jul 2026 | Web monitoring dashboard + JSON API. Self-hosted photo library |
+| Sep 2026 | Full operations review: crontab, backups, chat-ops bot, bandwidth, and costs |
+| Oct 8, 2026 | Relay admin moved to Tailscale only. Public SSH closed. Backup rotation |
+| Oct 9–10, 2026 | Own domain. Per-server subdomains. Reverse proxy with wildcard TLS. Internal dashboard. Guest least privilege with policy tests. Email anti-spoofing. Removed an unused Docker admin UI |
 
 ---
 
 ## Roadmap
 
-- Offsite copy of the game world backups
-- Custom domain for the relay, so the address survives a provider switch
-- Move the relay to a cheaper VPS closer to PH players when cloud credit runs out
-- Wazuh (HIDS) for security monitoring
-- Dedicated mini PC running Proxmox to replace the laptop
+- Make the tunnel client start reliably on every boot
+- Add an offsite backup copy and scheduled restore tests
+- More granular device policies in the tailnet
+- Re-run the pentest for a before/after comparison
+- Security headers on all private apps, aiming for an A+ grade
+- Weekly hardware health reports (battery health, SSD wear)
+- A SIEM (Wazuh) on a separate cloud instance
+- A portfolio site on my domain
+
+---
+
+## Skills this shows
+
+- **Network design:** CGNAT, reverse tunnels, relay architecture
+- **Zero trust access:** identity-based access, least privilege, defense in depth
+- **Policy as code:** access rules with automated allow/deny tests
+- **PKI / TLS automation:** ACME, DNS-01 challenges, wildcard certificates
+- **DNS:** A, CNAME, SRV, MX, and TXT records
+- **Email security:** SPF, DKIM, DMARC
+- **Linux and containers:** Ubuntu Server, systemd, Docker, Docker Compose
+- **Firewalls:** cloud network security groups and host firewall rules
+- **Monitoring and alerting:** custom dashboards, a JSON API, chat-ops alerts
+- **Security assessment:** recon with nmap, nikto, and curl, then fixing findings
+- **Documentation and cost tracking:** runbooks, disaster recovery plans, monthly costs
+
+---
+
+*Last updated: October 2026*
